@@ -47,6 +47,8 @@ const PLAYBACK_TYPES: [&rspotify::model::AdditionalType; 2] = [
 const ARTIST_TRACKS_TARGET: usize = 40;
 /// Number of related artists derived from the artist's radio on an artist page.
 const RELATED_ARTISTS_LIMIT: usize = 20;
+/// Number of concurrent librespot metadata requests when resolving many items.
+const LIBRESPOT_CONCURRENCY: usize = 16;
 
 /// The application's Spotify client
 #[derive(Clone)]
@@ -1567,38 +1569,32 @@ impl AppClient {
         // Prefer librespot's metadata API for the artist page: the Web API's top-tracks
         // endpoint is unavailable to development-mode client IDs, and their per-endpoint
         // daily quotas are quickly exhausted by album listings.
-        let mut context = match self.artist_context_via_librespot(&artist_id).await {
-            Ok(context) => context,
+        match self.artist_context_via_librespot(&artist_id).await {
+            Ok(context) => Ok(context),
             Err(err) => {
                 tracing::warn!(
                     "Failed to get artist context via librespot, falling back to the Web API: {err:#}"
                 );
-                self.artist_context_via_web_api(&artist_id).await?
-            }
-        };
-
-        // Spotify only provides 10 top tracks; extend the list with more of the artist's
-        // popular tracks from search results, which are roughly ordered by popularity.
-        if let Context::Artist {
-            artist, top_tracks, ..
-        } = &mut context
-        {
-            if top_tracks.len() < ARTIST_TRACKS_TARGET {
-                let more = self
-                    .artist_tracks_via_search(artist, top_tracks, ARTIST_TRACKS_TARGET)
-                    .await;
-                top_tracks.extend(more);
+                let mut context = self.artist_context_via_web_api(&artist_id).await?;
+                if let Context::Artist {
+                    artist, top_tracks, ..
+                } = &mut context
+                {
+                    if top_tracks.len() < ARTIST_TRACKS_TARGET {
+                        let more = self
+                            .artist_tracks_via_search(artist, top_tracks, ARTIST_TRACKS_TARGET)
+                            .await;
+                        top_tracks.extend(more);
+                    }
+                }
+                Ok(context)
             }
         }
-
-        Ok(context)
     }
 
     /// Get an artist context (name, top tracks, albums, related artists) through
-    /// librespot's metadata API, i.e. without using the Web API.
+    /// librespot's metadata API; the Web API is only used to extend the top-tracks list.
     async fn artist_context_via_librespot(&self, artist_id: &ArtistId<'_>) -> Result<Context> {
-        use futures::StreamExt;
-
         let session = self.spotify.session().await;
         let uri = SpotifyUri::from_uri(&artist_id.uri())?;
         let metadata =
@@ -1620,7 +1616,6 @@ impl AppClient {
             .or_else(|| metadata.top_tracks.first())
             .map(|t| t.tracks.0.clone())
             .unwrap_or_default();
-        let top_tracks = self.tracks_via_librespot(&session, top_track_uris).await;
 
         // albums and singles: each group holds the release variants of one album,
         // the first entry being the current one
@@ -1630,7 +1625,96 @@ impl AppClient {
             .chain(metadata.singles.iter())
             .filter_map(|group| group.first().cloned())
             .collect::<Vec<_>>();
-        let albums = futures::stream::iter(album_uris)
+
+        let metadata_related = metadata
+            .related
+            .iter()
+            .filter_map(Artist::try_from_librespot_artist)
+            .collect::<Vec<_>>();
+
+        // Spotify no longer populates related artists in its metadata, so approximate them
+        // with the other artists featured in the artist's radio (a "fans also like" style mix).
+        let related_artists_fut = async {
+            if !metadata_related.is_empty() {
+                return metadata_related;
+            }
+            match self.radio_tracks(artist_id.uri()).await {
+                Ok(tracks) => {
+                    let mut seen = HashSet::from([artist_id.clone_static()]);
+                    tracks
+                        .into_iter()
+                        .flat_map(|track| track.artists)
+                        .filter(|a| seen.insert(a.id.clone_static()))
+                        .take(RELATED_ARTISTS_LIMIT)
+                        .collect()
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        "Failed to derive related artists from the artist's radio: {err:#}"
+                    );
+                    Vec::new()
+                }
+            }
+        };
+
+        // the four parts are independent, fetch them concurrently
+        let started = std::time::Instant::now();
+        let (top_tracks, albums, related_artists, more_tracks) = tokio::join!(
+            async {
+                let r = self.tracks_via_librespot(&session, top_track_uris).await;
+                tracing::info!("artist page: top tracks took {:?}", started.elapsed());
+                r
+            },
+            async {
+                let r = self.albums_via_librespot(&session, album_uris).await;
+                tracing::info!("artist page: albums took {:?}", started.elapsed());
+                r
+            },
+            async {
+                let r = related_artists_fut.await;
+                tracing::info!("artist page: related artists took {:?}", started.elapsed());
+                r
+            },
+            // Spotify only provides 10 top tracks; extend the list with more of the artist's
+            // popular tracks from search results, which are roughly ordered by popularity
+            async {
+                let r = self
+                    .artist_tracks_via_search(&artist, &[], ARTIST_TRACKS_TARGET)
+                    .await;
+                tracing::info!("artist page: search fill took {:?}", started.elapsed());
+                r
+            },
+        );
+
+        let mut top_tracks = top_tracks;
+        let mut seen = top_tracks
+            .iter()
+            .map(|t| t.id.clone_static())
+            .collect::<HashSet<_>>();
+        top_tracks.extend(
+            more_tracks
+                .into_iter()
+                .filter(|t| seen.insert(t.id.clone_static())),
+        );
+        top_tracks.truncate(ARTIST_TRACKS_TARGET);
+
+        Ok(Context::Artist {
+            artist,
+            top_tracks,
+            albums: AppClient::process_artist_albums(albums),
+            related_artists,
+        })
+    }
+
+    /// Get albums' details through librespot's metadata API, keeping the given order.
+    async fn albums_via_librespot(
+        &self,
+        session: &librespot_core::Session,
+        uris: Vec<SpotifyUri>,
+    ) -> Vec<Album> {
+        use futures::StreamExt;
+
+        futures::stream::iter(uris)
             .map(|uri| {
                 let session = session.clone();
                 async move {
@@ -1647,46 +1731,10 @@ impl AppClient {
                     }
                 }
             })
-            .buffered(8)
+            .buffered(LIBRESPOT_CONCURRENCY)
             .filter_map(|album| async move { album })
             .collect::<Vec<_>>()
-            .await;
-        let albums = AppClient::process_artist_albums(albums);
-
-        let related_artists = metadata
-            .related
-            .iter()
-            .filter_map(Artist::try_from_librespot_artist)
-            .collect::<Vec<_>>();
-
-        // Spotify no longer populates related artists in its metadata, so approximate them
-        // with the other artists featured in the artist's radio (a "fans also like" style mix).
-        let related_artists = if related_artists.is_empty() {
-            match self.radio_tracks(artist_id.uri()).await {
-                Ok(tracks) => {
-                    let mut seen = HashSet::from([artist_id.clone_static()]);
-                    tracks
-                        .into_iter()
-                        .flat_map(|track| track.artists)
-                        .filter(|a| seen.insert(a.id.clone_static()))
-                        .take(RELATED_ARTISTS_LIMIT)
-                        .collect()
-                }
-                Err(err) => {
-                    tracing::warn!("Failed to derive related artists from the artist's radio: {err:#}");
-                    Vec::new()
-                }
-            }
-        } else {
-            related_artists
-        };
-
-        Ok(Context::Artist {
-            artist,
-            top_tracks,
-            albums,
-            related_artists,
-        })
+            .await
     }
 
     /// Get an artist context through the Web API (used when librespot is unavailable).
@@ -1761,7 +1809,7 @@ impl AppClient {
                     }
                 }
             })
-            .buffered(8)
+            .buffered(LIBRESPOT_CONCURRENCY)
             .filter_map(|track| async move { track })
             .collect::<Vec<_>>()
             .await
@@ -1775,7 +1823,11 @@ impl AppClient {
         existing: &[Track],
         target: usize,
     ) -> Vec<Track> {
+        // pages are fetched in small parallel batches (development-mode searches return
+        // only a handful of items per page)
         const MAX_PAGES: usize = 8;
+        const BATCH: usize = 4;
+        const PAGE_SIZE: u32 = 10;
 
         let query = format!("artist:\"{}\"", artist.name);
         let mut seen = existing
@@ -1783,47 +1835,61 @@ impl AppClient {
             .map(|t| t.id.clone_static())
             .collect::<HashSet<_>>();
         let mut tracks = Vec::new();
-        let mut offset = 0;
 
-        for _ in 0..MAX_PAGES {
+        for batch in 0..(MAX_PAGES / BATCH) {
             if existing.len() + tracks.len() >= target {
                 break;
             }
-            let page = match self
-                .deref()
-                .search(
-                    &query,
-                    rspotify::model::SearchType::Track,
-                    None,
-                    None,
-                    Some(10),
-                    Some(offset),
-                )
-                .await
-            {
-                Ok(rspotify::model::SearchResult::Tracks(page)) => page,
-                Ok(_) => break,
-                Err(err) => {
-                    tracing::warn!("Failed to search more tracks of artist {}: {err:#}", artist.name);
-                    break;
+            let pages = futures::future::join_all((0..BATCH).map(|i| {
+                let offset = ((batch * BATCH + i) as u32) * PAGE_SIZE;
+                let query = &query;
+                async move {
+                    self.deref()
+                        .search(
+                            query,
+                            rspotify::model::SearchType::Track,
+                            None,
+                            None,
+                            Some(PAGE_SIZE),
+                            Some(offset),
+                        )
+                        .await
                 }
-            };
-            if page.items.is_empty() {
-                break;
-            }
-            offset += page.items.len() as u32;
+            }))
+            .await;
 
-            for track in page.items.into_iter().filter_map(Track::try_from_full_track) {
-                // only keep tracks actually by this artist and not seen before
-                if track.artists.iter().any(|a| a.id == artist.id) && seen.insert(track.id.clone_static()) {
-                    tracks.push(track);
-                    if existing.len() + tracks.len() >= target {
-                        break;
+            let mut exhausted = false;
+            for page in pages {
+                let page = match page {
+                    Ok(rspotify::model::SearchResult::Tracks(page)) => page,
+                    Ok(_) => continue,
+                    Err(err) => {
+                        tracing::warn!(
+                            "Failed to search more tracks of artist {}: {err:#}",
+                            artist.name
+                        );
+                        exhausted = true;
+                        continue;
+                    }
+                };
+                if page.items.is_empty() {
+                    exhausted = true;
+                }
+                for track in page.items.into_iter().filter_map(Track::try_from_full_track) {
+                    // only keep tracks actually by this artist and not seen before
+                    if track.artists.iter().any(|a| a.id == artist.id)
+                        && seen.insert(track.id.clone_static())
+                    {
+                        tracks.push(track);
                     }
                 }
             }
+            if exhausted {
+                break;
+            }
         }
 
+        tracks.truncate(target.saturating_sub(existing.len()));
         tracks
     }
 
