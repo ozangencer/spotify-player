@@ -16,7 +16,18 @@ use super::ClientRequest;
 struct PlayerEventHandlerState {
     get_context_timer: Instant,
     last_playback_refresh_timer: Instant,
+    /// Last time a playback/queue poll was triggered by the 100ms event watcher.
+    /// Used to avoid re-sending the same request every tick while it keeps failing.
+    last_event_poll_timer: Option<Instant>,
 }
+
+/// Minimum interval between two playback/queue polls triggered by the event watcher.
+const EVENT_POLL_MIN_INTERVAL: Duration = Duration::from_secs(2);
+
+/// Maximum number of retries for a request rejected with `429 Too Many Requests`.
+const RATE_LIMIT_MAX_RETRIES: u32 = 4;
+/// Base delay for the exponential backoff between rate-limit retries (2s, 4s, 8s, 16s).
+const RATE_LIMIT_BASE_DELAY: Duration = Duration::from_secs(2);
 
 /// starts the client's request handler
 pub async fn start_client_handler(
@@ -31,8 +42,34 @@ pub async fn start_client_handler(
 
         tokio::task::spawn(
             async move {
-                if let Err(err) = client.handle_request(&state, request).await {
-                    tracing::error!("Failed to handle client request: {err:#}");
+                // Requests that are already re-issued periodically by other mechanisms
+                // (playback polling, context page refresh) are not retried here, otherwise
+                // retries would pile up while being rate-limited.
+                let retryable = match &request {
+                    ClientRequest::GetCurrentPlayback | ClientRequest::GetCurrentUserQueue => false,
+                    ClientRequest::GetContext(id) => matches!(id, ContextId::Tracks(_)),
+                    _ => true,
+                };
+
+                let mut attempt = 0u32;
+                loop {
+                    match client.handle_request(&state, request.clone()).await {
+                        Ok(()) => break,
+                        Err(err) => {
+                            let rate_limited = format!("{err:#}").contains("429");
+                            if retryable && rate_limited && attempt < RATE_LIMIT_MAX_RETRIES {
+                                let delay = RATE_LIMIT_BASE_DELAY * 2u32.pow(attempt);
+                                attempt += 1;
+                                tracing::warn!(
+                                    "Rate limited by Spotify (429), retrying in {delay:?} (attempt {attempt}/{RATE_LIMIT_MAX_RETRIES})"
+                                );
+                                tokio::time::sleep(delay).await;
+                                continue;
+                            }
+                            tracing::error!("Failed to handle client request: {err:#}");
+                            break;
+                        }
+                    }
                 }
             }
             .instrument(span),
@@ -60,7 +97,17 @@ pub async fn start_session_watcher(state: SharedState, client: super::AppClient)
 fn handle_playback_change_event(
     state: &SharedState,
     client_pub: &flume::Sender<ClientRequest>,
+    handler_state: &mut PlayerEventHandlerState,
 ) -> anyhow::Result<()> {
+    // throttle: while a previous poll is still failing (e.g. rate-limited), don't
+    // re-send the same request on every 100ms tick
+    if handler_state
+        .last_event_poll_timer
+        .is_some_and(|t| t.elapsed() < EVENT_POLL_MIN_INTERVAL)
+    {
+        return Ok(());
+    }
+
     let player = state.player.read();
     let (playback, id, duration) = match (
         player.buffered_playback.as_ref(),
@@ -83,6 +130,7 @@ fn handle_playback_change_event(
         // update the playback when the current track ends
         if progress >= duration && playback.is_playing {
             client_pub.send(ClientRequest::GetCurrentPlayback)?;
+            handler_state.last_event_poll_timer = Some(Instant::now());
         }
     }
 
@@ -91,10 +139,12 @@ fn handle_playback_change_event(
         if let Some(queue_track) = queue.currently_playing.as_ref() {
             if queue_track.id().expect("null track_id") != id {
                 client_pub.send(ClientRequest::GetCurrentUserQueue)?;
+                handler_state.last_event_poll_timer = Some(Instant::now());
             }
         }
     } else {
         client_pub.send(ClientRequest::GetCurrentUserQueue)?;
+        handler_state.last_event_poll_timer = Some(Instant::now());
     }
 
     Ok(())
@@ -191,7 +241,8 @@ fn handle_player_event(
 ) -> anyhow::Result<()> {
     handle_page_change_event(state, client_pub, handler_state)
         .context("handle page change event")?;
-    handle_playback_change_event(state, client_pub).context("handle playback change event")?;
+    handle_playback_change_event(state, client_pub, handler_state)
+        .context("handle playback change event")?;
 
     Ok(())
 }
@@ -206,6 +257,7 @@ pub fn start_player_event_watcher(state: &SharedState, client_pub: &flume::Sende
     let mut handler_state = PlayerEventHandlerState {
         get_context_timer: Instant::now(),
         last_playback_refresh_timer: Instant::now(),
+        last_event_poll_timer: None,
     };
 
     loop {

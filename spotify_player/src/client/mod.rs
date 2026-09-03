@@ -1080,76 +1080,96 @@ impl AppClient {
 
     /// Search for items (tracks, artists, albums, playlists) matching a given query
     pub async fn search(&self, query: &str) -> Result<SearchResults> {
-        let (
-            track_result,
-            artist_result,
-            album_result,
-            playlist_result,
-            show_result,
-            episode_result,
-        ) = tokio::try_join!(
-            self.search_specific_type(query, rspotify::model::SearchType::Track),
-            self.search_specific_type(query, rspotify::model::SearchType::Artist),
-            self.search_specific_type(query, rspotify::model::SearchType::Album),
-            self.search_specific_type(query, rspotify::model::SearchType::Playlist),
-            self.search_specific_type(query, rspotify::model::SearchType::Show),
-            self.search_specific_type(query, rspotify::model::SearchType::Episode)
-        )?;
+        use rspotify::model::{SearchResult, SearchType};
 
-        let (tracks, artists, albums, playlists, shows, episodes) = (
-            match track_result {
-                rspotify::model::SearchResult::Tracks(p) => p
-                    .items
-                    .into_iter()
-                    .filter_map(Track::try_from_full_track)
-                    .collect(),
-                _ => anyhow::bail!("expect a track search result"),
-            },
-            match artist_result {
-                rspotify::model::SearchResult::Artists(p) => {
-                    p.items.into_iter().map(std::convert::Into::into).collect()
-                }
-                _ => anyhow::bail!("expect an artist search result"),
-            },
-            match album_result {
-                rspotify::model::SearchResult::Albums(p) => p
-                    .items
-                    .into_iter()
-                    .filter_map(Album::try_from_simplified_album)
-                    .collect(),
-                _ => anyhow::bail!("expect an album search result"),
-            },
-            match playlist_result {
-                rspotify::model::SearchResult::Playlists(p) => {
-                    p.items.into_iter().map(std::convert::Into::into).collect()
-                }
-                _ => anyhow::bail!("expect a playlist search result"),
-            },
-            match show_result {
-                rspotify::model::SearchResult::Shows(p) => {
-                    p.items.into_iter().map(std::convert::Into::into).collect()
-                }
-                _ => anyhow::bail!("expect a show search result"),
-            },
-            match episode_result {
-                rspotify::model::SearchResult::Episodes(p) => {
-                    p.items.into_iter().map(std::convert::Into::into).collect()
-                }
-                _ => anyhow::bail!("expect a episode search result"),
-            },
-        );
+        // Search requests are sent sequentially instead of in parallel to avoid bursting
+        // Spotify's per-application rate limit (429 Too Many Requests). A failure of a single
+        // search type doesn't fail the whole search as long as at least one type succeeds.
+        // Show/episode searches are skipped: they cost two extra requests per query and their
+        // results don't always deserialize with the current models.
+        let mut n_ok = 0usize;
+        let mut last_err: Option<anyhow::Error> = None;
+
+        let track_result = self
+            .search_one(query, SearchType::Track, &mut n_ok, &mut last_err)
+            .await;
+        let artist_result = self
+            .search_one(query, SearchType::Artist, &mut n_ok, &mut last_err)
+            .await;
+        let album_result = self
+            .search_one(query, SearchType::Album, &mut n_ok, &mut last_err)
+            .await;
+        let playlist_result = self
+            .search_one(query, SearchType::Playlist, &mut n_ok, &mut last_err)
+            .await;
+
+        if n_ok == 0 {
+            return Err(last_err
+                .unwrap_or_else(|| anyhow::anyhow!("no search result"))
+                .context(format!("search for \"{query}\"")));
+        }
+
+        let tracks = match track_result {
+            Some(SearchResult::Tracks(p)) => p
+                .items
+                .into_iter()
+                .filter_map(Track::try_from_full_track)
+                .collect(),
+            _ => Vec::new(),
+        };
+        let artists = match artist_result {
+            Some(SearchResult::Artists(p)) => {
+                p.items.into_iter().map(std::convert::Into::into).collect()
+            }
+            _ => Vec::new(),
+        };
+        let albums = match album_result {
+            Some(SearchResult::Albums(p)) => p
+                .items
+                .into_iter()
+                .filter_map(Album::try_from_simplified_album)
+                .collect(),
+            _ => Vec::new(),
+        };
+        let playlists = match playlist_result {
+            Some(SearchResult::Playlists(p)) => {
+                p.items.into_iter().map(std::convert::Into::into).collect()
+            }
+            _ => Vec::new(),
+        };
 
         Ok(SearchResults {
             tracks,
             artists,
             albums,
             playlists,
-            shows,
-            episodes,
+            shows: Vec::new(),
+            episodes: Vec::new(),
         })
     }
 
-    /// Search for items of a specific type matching a given query
+    /// Runs a single-type search, counting successes and remembering the last error
+    /// so that `search` can tolerate partial failures.
+    async fn search_one(
+        &self,
+        query: &str,
+        search_type: rspotify::model::SearchType,
+        n_ok: &mut usize,
+        last_err: &mut Option<anyhow::Error>,
+    ) -> Option<rspotify::model::SearchResult> {
+        match self.search_specific_type(query, search_type).await {
+            Ok(result) => {
+                *n_ok += 1;
+                Some(result)
+            }
+            Err(err) => {
+                tracing::warn!("Search ({search_type:?}) for \"{query}\" failed: {err:#}");
+                *last_err = Some(err);
+                None
+            }
+        }
+    }
+
     pub async fn search_specific_type(
         &self,
         query: &str,
@@ -1157,7 +1177,8 @@ impl AppClient {
     ) -> Result<rspotify::model::SearchResult> {
         Ok(self
             .deref()
-            .search(query, typ, None, None, None, None)
+            // development-mode client IDs cap the search limit at 10 (default 5)
+            .search(query, typ, None, None, Some(10), None)
             .await?)
     }
 
@@ -1413,7 +1434,7 @@ impl AppClient {
         let tracks = self
             .all_paging_items(
                 &format!(
-                    "{SPOTIFY_API_ENDPOINT}/playlists/{}/tracks",
+                    "{SPOTIFY_API_ENDPOINT}/playlists/{}/items",
                     playlist_id.id(),
                 ),
                 playlist.tracks.total as usize,
@@ -1478,13 +1499,21 @@ impl AppClient {
             .context("get artist")?
             .into();
 
-        let top_tracks = self
+        // The top-tracks endpoint is not available to development-mode client IDs,
+        // so a failure here must not break the whole artist page.
+        let top_tracks = match self
             .artist_top_tracks(artist_id.as_ref(), Some(rspotify::model::Market::FromToken))
             .await
-            .context("get artist's top tracks")?
-            .into_iter()
-            .filter_map(Track::try_from_full_track)
-            .collect::<Vec<_>>();
+        {
+            Ok(tracks) => tracks
+                .into_iter()
+                .filter_map(Track::try_from_full_track)
+                .collect::<Vec<_>>(),
+            Err(err) => {
+                tracing::warn!("Failed to get artist's top tracks: {err:#}");
+                Vec::new()
+            }
+        };
 
         #[allow(deprecated)]
         let related_artists = self
@@ -1575,8 +1604,11 @@ impl AppClient {
     where
         T: serde::de::DeserializeOwned + std::fmt::Debug,
     {
-        const PAGE_LIMIT: usize = 50;
-        const MAX_PARALLEL: usize = 8;
+        // Kept low to avoid bursting Spotify's per-application rate limit.
+        const MAX_PARALLEL: usize = 3;
+        // Development-mode client IDs cap some endpoints (e.g. artist albums) at 10 items
+        // per page; start with the regular limit and fall back to 10 if it gets rejected.
+        let mut page_limit: usize = 50;
 
         let mut all_items = Vec::new();
         let mut offset = 0;
@@ -1587,13 +1619,13 @@ impl AppClient {
         }
 
         while offset < count {
-            let n_jobs = std::cmp::min(MAX_PARALLEL, (count - offset).div_ceil(PAGE_LIMIT));
+            let n_jobs = std::cmp::min(MAX_PARALLEL, (count - offset).div_ceil(page_limit));
 
             let mut futures = Vec::with_capacity(n_jobs);
 
             for i in 0..n_jobs {
-                let current_offset = offset + i * PAGE_LIMIT;
-                let limit_str = PAGE_LIMIT.to_string();
+                let current_offset = offset + i * page_limit;
+                let limit_str = page_limit.to_string();
                 let offset_str = current_offset.to_string();
 
                 futures.push(async move {
@@ -1607,7 +1639,17 @@ impl AppClient {
                 });
             }
 
-            let results = futures::future::try_join_all(futures).await?;
+            let results = match futures::future::try_join_all(futures).await {
+                Ok(results) => results,
+                Err(err) if page_limit > 10 && format!("{err:#}").contains("Invalid limit") => {
+                    tracing::warn!(
+                        "Page limit {page_limit} rejected for {base_url}, retrying with a limit of 10"
+                    );
+                    page_limit = 10;
+                    continue;
+                }
+                Err(err) => return Err(err),
+            };
 
             let mut found_empty = false;
             for mut page in results {
@@ -1622,7 +1664,7 @@ impl AppClient {
                 break;
             }
 
-            offset += n_jobs * PAGE_LIMIT;
+            offset += n_jobs * page_limit;
         }
 
         Ok(all_items)

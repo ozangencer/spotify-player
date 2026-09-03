@@ -1,6 +1,14 @@
 [workspace]
 members = ["spotify_player"]
+exclude = ["vendor"]
 resolver = "2"
+
+# Vendored rspotify with fixes for the Spotify Web API "Development Mode" changes
+# (February 2026): stripped fields get serde defaults, playlist `tracks` -> `items`,
+# library/playlist endpoints moved to `/me/library` and `/playlists/{id}/items`.
+[patch.crates-io]
+rspotify = { path = "vendor/rspotify" }
+rspotify-model = { path = "vendor/rspotify-model" }
 
 [profile.release]
 debug = 1
