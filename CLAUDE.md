@@ -2,6 +2,45 @@
 
 This file guides Claude Code when working in this repository.
 
+## Fork notes (ozangencer/spotify-player, branch `devmode-ratelimit-fixes`)
+
+This is Ozan's fork of `aome510/spotify-player` v0.24.1. Upstream is the `upstream` remote;
+rebase this branch onto new upstream tags when they appear.
+
+**Why the fork exists.** The bundled (ncspot) client ID is rate limited around the clock, so
+Ozan uses his own Spotify Developer app (`client_id` in `~/.config/spotify-player/app.toml`).
+New apps are in Spotify's "Development Mode" (February 2026 rules): stripped fields
+(`popularity`, `followers`, `genres`), playlist `tracks` -> `items`, `/me/library` endpoints,
+removed endpoints (browse, artist top tracks, batch fetches), per-endpoint **daily** quotas
+with long `Retry-After`. Upstream 0.24.1 breaks on all of this.
+
+**What the branch changes** (see `git log v0.24.1..HEAD`):
+- `vendor/rspotify*`: vendored rspotify 0.15.3 via `[patch.crates-io]` with serde defaults,
+  `items`/`item` aliases and the new endpoints.
+- `client/mod.rs`: librespot metadata (`librespot_metadata::{Artist,Album,Track,Playlist}`)
+  serves the artist page, playlists the user doesn't own, and radio tracks; the Web API is
+  kept for the user library, search, playback control and likes. Search is sequential and
+  tolerant; page limits adapt; `Retry-After` puts requests on hold (`set_cooldown`).
+- `client/handlers.rs`: 429 retry with backoff, throttled playback polling.
+- `state/model.rs`: `try_from_librespot_*` conversions.
+
+**Build / install** (same feature set as the Homebrew formula; brew package is uninstalled):
+```sh
+cargo build --release -p spotify_player --features image,notify
+cargo install --path spotify_player --features image,notify --target-dir target   # -> ~/.cargo/bin
+```
+Backup binary, patch and Turkish README: `~/.local/share/spotify-player-patched/`.
+
+**Testing without burning Ozan's quota.** While the TUI runs, CLI commands go through its
+socket and its Web API quota. Test standalone with a config on another port
+(`-c <dir>` with `client_port = 18080`), prefer CLI `get item ...` over starting the TUI,
+and keep Web API calls to a minimum; the daily quotas are small.
+
+**Playback.** The integrated librespot player cannot get audio keys for this account
+(librespot #1649), so `enable_streaming = "Never"` and the official Spotify app is the
+playback device; the TUI acts as a remote.
+
+
 ## Project Overview
 
 `spotify-player` is a terminal Spotify client (requires Spotify Premium) written in Rust. It supports playback control, Spotify Connect, direct streaming via librespot, synced lyrics, desktop notifications, OS media controls, album art rendering, a daemon mode, and a full CLI interface.
