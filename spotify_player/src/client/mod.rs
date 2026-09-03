@@ -1530,12 +1530,105 @@ impl AppClient {
             .await
             .context("get artist's albums")?;
 
+        // The Web API's top-tracks and related-artists endpoints are unavailable to
+        // development-mode client IDs; fall back to librespot's metadata API for them.
+        let (top_tracks, related_artists) = if top_tracks.is_empty() || related_artists.is_empty() {
+            match self.artist_extras_via_librespot(&artist_id).await {
+                Ok((lr_top_tracks, lr_related_artists)) => (
+                    if top_tracks.is_empty() {
+                        lr_top_tracks
+                    } else {
+                        top_tracks
+                    },
+                    if related_artists.is_empty() {
+                        lr_related_artists
+                    } else {
+                        related_artists
+                    },
+                ),
+                Err(err) => {
+                    tracing::warn!(
+                        "Failed to get artist's top tracks/related artists via librespot: {err:#}"
+                    );
+                    (top_tracks, related_artists)
+                }
+            }
+        } else {
+            (top_tracks, related_artists)
+        };
+
         Ok(Context::Artist {
             artist,
             top_tracks,
             albums,
             related_artists,
         })
+    }
+
+    /// Get an artist's top tracks and related artists using librespot's metadata API.
+    ///
+    /// The corresponding Web API endpoints are not available to development-mode client
+    /// IDs (Spotify's February 2026 changes), but the internal metadata API used by the
+    /// integrated librespot client still provides both.
+    async fn artist_extras_via_librespot(
+        &self,
+        artist_id: &ArtistId<'_>,
+    ) -> Result<(Vec<Track>, Vec<Artist>)> {
+        let session = self.spotify.session().await;
+        let uri = SpotifyUri::from_uri(&artist_id.uri())?;
+        let metadata = <librespot_metadata::Artist as librespot_metadata::Metadata>::get(&session, &uri)
+            .await
+            .context("get artist metadata via librespot")?;
+
+        // top tracks are listed per country, prefer the user's country
+        let country = session.country();
+        let track_ids = metadata
+            .top_tracks
+            .iter()
+            .find(|t| t.country == country)
+            .or_else(|| metadata.top_tracks.first())
+            .map(|t| t.tracks.0.clone())
+            .unwrap_or_default()
+            .into_iter()
+            .take(10)
+            .filter_map(|uri| match uri {
+                SpotifyUri::Track { id } => id.to_base62().ok(),
+                _ => None,
+            })
+            .filter_map(|id| TrackId::from_id(id).ok())
+            .collect::<Vec<_>>();
+
+        // batch track fetching is unavailable as well, so fetch the tracks one by one
+        let top_tracks =
+            futures::future::join_all(track_ids.iter().map(|id| self.track(id.as_ref())))
+                .await
+                .into_iter()
+                .filter_map(|result| match result {
+                    Ok(track) => Some(track),
+                    Err(err) => {
+                        tracing::warn!("Failed to get a top track's details: {err:#}");
+                        None
+                    }
+                })
+                .collect::<Vec<_>>();
+
+        let related_artists = metadata
+            .related
+            .iter()
+            .filter_map(|a| match &a.id {
+                SpotifyUri::Artist { id } => id
+                    .to_base62()
+                    .ok()
+                    .and_then(|id| ArtistId::from_id(id).ok())
+                    .map(|id| Artist {
+                        id,
+                        name: a.name.clone(),
+                    }),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        Ok((top_tracks, related_artists))
     }
 
     /// Get a show context data
