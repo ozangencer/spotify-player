@@ -44,7 +44,7 @@ const PLAYBACK_TYPES: [&rspotify::model::AdditionalType; 2] = [
 
 /// Number of tracks to show on an artist page's top-tracks section
 /// (Spotify's top-tracks list has 10 entries, the rest is filled from search results).
-const ARTIST_TRACKS_TARGET: usize = 30;
+const ARTIST_TRACKS_TARGET: usize = 40;
 
 /// The application's Spotify client
 #[derive(Clone)]
@@ -1435,8 +1435,19 @@ impl AppClient {
             )
             .await?;
 
-        let tracks = self
-            .all_paging_items(
+        // Development-mode client IDs only get the items of playlists the user owns or
+        // collaborates on (the response then carries no items and `total` is 0), so in that
+        // case fetch the tracks through librespot's metadata API instead.
+        let tracks = if playlist.tracks.total == 0 {
+            match self.playlist_tracks_via_librespot(&playlist_id).await {
+                Ok(tracks) => tracks,
+                Err(err) => {
+                    tracing::warn!("Failed to get playlist tracks via librespot: {err:#}");
+                    Vec::new()
+                }
+            }
+        } else {
+            self.all_paging_items(
                 &format!(
                     "{SPOTIFY_API_ENDPOINT}/playlists/{}/items",
                     playlist_id.id(),
@@ -1446,12 +1457,63 @@ impl AppClient {
             .await?
             .into_iter()
             .filter_map(Track::try_from_playlist_item)
-            .collect::<Vec<_>>();
+            .collect::<Vec<_>>()
+        };
 
         Ok(Context::Playlist {
             playlist: playlist.into(),
             tracks,
         })
+    }
+
+    /// Get a playlist's tracks using librespot's metadata API (no Web API quota is used).
+    async fn playlist_tracks_via_librespot(
+        &self,
+        playlist_id: &PlaylistId<'_>,
+    ) -> Result<Vec<Track>> {
+        use futures::StreamExt;
+
+        let session = self.spotify.session().await;
+        let uri = SpotifyUri::from_uri(&playlist_id.uri())?;
+        let playlist =
+            <librespot_metadata::Playlist as librespot_metadata::Metadata>::get(&session, &uri)
+                .await
+                .context("get playlist metadata via librespot")?;
+
+        let track_uris = playlist
+            .tracks()
+            .filter(|uri| matches!(uri, SpotifyUri::Track { .. }))
+            .cloned()
+            .collect::<Vec<_>>();
+        tracing::info!(
+            "Fetching {} tracks of playlist {} via librespot",
+            track_uris.len(),
+            playlist_id.uri()
+        );
+
+        let tracks = futures::stream::iter(track_uris)
+            .map(|uri| {
+                let session = session.clone();
+                async move {
+                    match <librespot_metadata::Track as librespot_metadata::Metadata>::get(
+                        &session, &uri,
+                    )
+                    .await
+                    {
+                        Ok(track) => Track::try_from_librespot_track(track),
+                        Err(err) => {
+                            tracing::warn!("Failed to get track {uri:?} via librespot: {err:#}");
+                            None
+                        }
+                    }
+                }
+            })
+            .buffered(8)
+            .filter_map(|track| async move { track })
+            .collect::<Vec<_>>()
+            .await;
+
+        Ok(tracks)
     }
 
     /// Get an album context data
@@ -1587,7 +1649,7 @@ impl AppClient {
         existing: &[Track],
         target: usize,
     ) -> Vec<Track> {
-        const MAX_PAGES: usize = 6;
+        const MAX_PAGES: usize = 8;
 
         let query = format!("artist:\"{}\"", artist.name);
         let mut seen = existing

@@ -417,6 +417,72 @@ impl Track {
 
         Track::try_from_full_track_with_date(track, item.added_at)
     }
+
+    /// tries to convert from a `librespot_metadata::Track` (Spotify's internal metadata API) into `Track`
+    pub fn try_from_librespot_track(track: librespot_metadata::Track) -> Option<Self> {
+        let librespot_core::SpotifyUri::Track { id } = &track.id else {
+            return None;
+        };
+        let id = TrackId::from_id(id.to_base62().ok()?).ok()?;
+
+        Some(Self {
+            id,
+            name: track.name.clone(),
+            artists: track
+                .artists
+                .iter()
+                .filter_map(Artist::try_from_librespot_artist)
+                .collect(),
+            album: Album::try_from_librespot_album(&track.album),
+            duration: std::time::Duration::from_millis(u64::try_from(track.duration).unwrap_or(0)),
+            explicit: track.is_explicit,
+            added_at: 0,
+        })
+    }
+}
+
+impl Album {
+    /// tries to convert from a `librespot_metadata::Album` into `Album`
+    pub fn try_from_librespot_album(album: &librespot_metadata::Album) -> Option<Self> {
+        let librespot_core::SpotifyUri::Album { id } = &album.id else {
+            return None;
+        };
+        let id = AlbumId::from_id(id.to_base62().ok()?).ok()?;
+        let typ = match format!("{:?}", album.album_type).as_str() {
+            "ALBUM" => Some(rspotify::model::AlbumType::Album),
+            "SINGLE" | "EP" => Some(rspotify::model::AlbumType::Single),
+            "COMPILATION" => Some(rspotify::model::AlbumType::Compilation),
+            _ => None,
+        };
+        let date = &album.date;
+        let release_date = format!("{:04}-{:02}-{:02}", date.year(), date.month() as u8, date.day());
+
+        Some(Self {
+            id,
+            release_date,
+            name: album.name.clone(),
+            artists: album
+                .artists
+                .iter()
+                .filter_map(Artist::try_from_librespot_artist)
+                .collect(),
+            typ,
+            added_at: 0,
+        })
+    }
+}
+
+impl Artist {
+    /// tries to convert from a `librespot_metadata::Artist` into `Artist`
+    pub fn try_from_librespot_artist(artist: &librespot_metadata::Artist) -> Option<Self> {
+        let librespot_core::SpotifyUri::Artist { id } = &artist.id else {
+            return None;
+        };
+        Some(Self {
+            id: ArtistId::from_id(id.to_base62().ok()?).ok()?,
+            name: artist.name.clone(),
+        })
+    }
 }
 
 impl std::fmt::Display for Track {
