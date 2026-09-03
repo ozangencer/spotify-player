@@ -42,6 +42,10 @@ const PLAYBACK_TYPES: [&rspotify::model::AdditionalType; 2] = [
     &rspotify::model::AdditionalType::Episode,
 ];
 
+/// Number of tracks to show on an artist page's top-tracks section
+/// (Spotify's top-tracks list has 10 entries, the rest is filled from search results).
+const ARTIST_TRACKS_TARGET: usize = 30;
+
 /// The application's Spotify client
 #[derive(Clone)]
 pub struct AppClient {
@@ -1557,12 +1561,82 @@ impl AppClient {
             (top_tracks, related_artists)
         };
 
+        // Spotify only provides 10 top tracks; extend the list with more of the artist's
+        // popular tracks from search results, which are roughly ordered by popularity.
+        let mut top_tracks = top_tracks;
+        if top_tracks.len() < ARTIST_TRACKS_TARGET {
+            let more = self
+                .artist_tracks_via_search(&artist, &top_tracks, ARTIST_TRACKS_TARGET)
+                .await;
+            top_tracks.extend(more);
+        }
+
         Ok(Context::Artist {
             artist,
             top_tracks,
             albums,
             related_artists,
         })
+    }
+
+    /// Get more of an artist's popular tracks using `artist:"<name>"` track searches,
+    /// skipping tracks already in `existing`, until `target` tracks in total are collected.
+    async fn artist_tracks_via_search(
+        &self,
+        artist: &Artist,
+        existing: &[Track],
+        target: usize,
+    ) -> Vec<Track> {
+        const MAX_PAGES: usize = 6;
+
+        let query = format!("artist:\"{}\"", artist.name);
+        let mut seen = existing
+            .iter()
+            .map(|t| t.id.clone_static())
+            .collect::<HashSet<_>>();
+        let mut tracks = Vec::new();
+        let mut offset = 0;
+
+        for _ in 0..MAX_PAGES {
+            if existing.len() + tracks.len() >= target {
+                break;
+            }
+            let page = match self
+                .deref()
+                .search(
+                    &query,
+                    rspotify::model::SearchType::Track,
+                    None,
+                    None,
+                    Some(10),
+                    Some(offset),
+                )
+                .await
+            {
+                Ok(rspotify::model::SearchResult::Tracks(page)) => page,
+                Ok(_) => break,
+                Err(err) => {
+                    tracing::warn!("Failed to search more tracks of artist {}: {err:#}", artist.name);
+                    break;
+                }
+            };
+            if page.items.is_empty() {
+                break;
+            }
+            offset += page.items.len() as u32;
+
+            for track in page.items.into_iter().filter_map(Track::try_from_full_track) {
+                // only keep tracks actually by this artist and not seen before
+                if track.artists.iter().any(|a| a.id == artist.id) && seen.insert(track.id.clone_static()) {
+                    tracks.push(track);
+                    if existing.len() + tracks.len() >= target {
+                        break;
+                    }
+                }
+            }
+        }
+
+        tracks
     }
 
     /// Get an artist's top tracks and related artists using librespot's metadata API.
@@ -1599,18 +1673,18 @@ impl AppClient {
             .collect::<Vec<_>>();
 
         // batch track fetching is unavailable as well, so fetch the tracks one by one
-        let top_tracks =
-            futures::future::join_all(track_ids.iter().map(|id| self.track(id.as_ref())))
-                .await
-                .into_iter()
-                .filter_map(|result| match result {
-                    Ok(track) => Some(track),
-                    Err(err) => {
-                        tracing::warn!("Failed to get a top track's details: {err:#}");
-                        None
-                    }
-                })
-                .collect::<Vec<_>>();
+        // (in small chunks to avoid bursting the client ID's quota)
+        let mut top_tracks = Vec::with_capacity(track_ids.len());
+        for chunk in track_ids.chunks(3) {
+            let results =
+                futures::future::join_all(chunk.iter().map(|id| self.track(id.as_ref()))).await;
+            for result in results {
+                match result {
+                    Ok(track) => top_tracks.push(track),
+                    Err(err) => tracing::warn!("Failed to get a top track's details: {err:#}"),
+                }
+            }
+        }
 
         let related_artists = metadata
             .related
