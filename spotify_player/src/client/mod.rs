@@ -45,6 +45,8 @@ const PLAYBACK_TYPES: [&rspotify::model::AdditionalType; 2] = [
 /// Number of tracks to show on an artist page's top-tracks section
 /// (Spotify's top-tracks list has 10 entries, the rest is filled from search results).
 const ARTIST_TRACKS_TARGET: usize = 40;
+/// Number of related artists derived from the artist's radio on an artist page.
+const RELATED_ARTISTS_LIMIT: usize = 20;
 
 /// The application's Spotify client
 #[derive(Clone)]
@@ -1656,6 +1658,28 @@ impl AppClient {
             .iter()
             .filter_map(Artist::try_from_librespot_artist)
             .collect::<Vec<_>>();
+
+        // Spotify no longer populates related artists in its metadata, so approximate them
+        // with the other artists featured in the artist's radio (a "fans also like" style mix).
+        let related_artists = if related_artists.is_empty() {
+            match self.radio_tracks(artist_id.uri()).await {
+                Ok(tracks) => {
+                    let mut seen = HashSet::from([artist_id.clone_static()]);
+                    tracks
+                        .into_iter()
+                        .flat_map(|track| track.artists)
+                        .filter(|a| seen.insert(a.id.clone_static()))
+                        .take(RELATED_ARTISTS_LIMIT)
+                        .collect()
+                }
+                Err(err) => {
+                    tracing::warn!("Failed to derive related artists from the artist's radio: {err:#}");
+                    Vec::new()
+                }
+            }
+        } else {
+            related_artists
+        };
 
         Ok(Context::Artist {
             artist,
