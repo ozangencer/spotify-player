@@ -57,6 +57,9 @@ pub struct AppClient {
     api_client: WebApiClient,
     #[cfg(feature = "streaming")]
     stream_conn: Arc<Mutex<Option<librespot_connect::Spirc>>>,
+    /// Requests Spotify asked us to hold off on (`429` with a long `Retry-After`, e.g. a
+    /// daily per-endpoint quota), keyed by the request's debug representation.
+    cooldowns: Arc<Mutex<HashMap<String, std::time::Instant>>>,
 }
 
 impl Deref for AppClient {
@@ -131,7 +134,30 @@ impl AppClient {
 
             #[cfg(feature = "streaming")]
             stream_conn: Arc::new(Mutex::new(None)),
+            cooldowns: Arc::new(Mutex::new(HashMap::new())),
         })
+    }
+
+    /// Puts a request on hold until Spotify's `Retry-After` deadline passes.
+    pub fn set_cooldown(&self, request: &ClientRequest, duration: std::time::Duration) {
+        self.cooldowns.lock().insert(
+            format!("{request:?}"),
+            std::time::Instant::now() + duration,
+        );
+    }
+
+    /// Returns how long a request is still on hold, if it is.
+    pub fn cooldown_remaining(&self, request: &ClientRequest) -> Option<std::time::Duration> {
+        let key = format!("{request:?}");
+        let mut cooldowns = self.cooldowns.lock();
+        let until = *cooldowns.get(&key)?;
+        let now = std::time::Instant::now();
+        if until > now {
+            Some(until - now)
+        } else {
+            cooldowns.remove(&key);
+            None
+        }
     }
 
     async fn token(&self) -> Result<String> {
@@ -431,6 +457,13 @@ impl AppClient {
         request: ClientRequest,
     ) -> Result<()> {
         let timer = tokio::time::Instant::now();
+
+        if let Some(remaining) = self.cooldown_remaining(&request) {
+            anyhow::bail!(
+                "request is on hold for another {}s (Spotify rejected it with a quota error)",
+                remaining.as_secs()
+            );
+        }
 
         match request {
             ClientRequest::GetBrowseCategories => {
@@ -1471,8 +1504,6 @@ impl AppClient {
         &self,
         playlist_id: &PlaylistId<'_>,
     ) -> Result<Vec<Track>> {
-        use futures::StreamExt;
-
         let session = self.spotify.session().await;
         let uri = SpotifyUri::from_uri(&playlist_id.uri())?;
         let playlist =
@@ -1491,29 +1522,7 @@ impl AppClient {
             playlist_id.uri()
         );
 
-        let tracks = futures::stream::iter(track_uris)
-            .map(|uri| {
-                let session = session.clone();
-                async move {
-                    match <librespot_metadata::Track as librespot_metadata::Metadata>::get(
-                        &session, &uri,
-                    )
-                    .await
-                    {
-                        Ok(track) => Track::try_from_librespot_track(track),
-                        Err(err) => {
-                            tracing::warn!("Failed to get track {uri:?} via librespot: {err:#}");
-                            None
-                        }
-                    }
-                }
-            })
-            .buffered(8)
-            .filter_map(|track| async move { track })
-            .collect::<Vec<_>>()
-            .await;
-
-        Ok(tracks)
+        Ok(self.tracks_via_librespot(&session, track_uris).await)
     }
 
     /// Get an album context data
@@ -1557,8 +1566,111 @@ impl AppClient {
         let artist_uri = artist_id.uri();
         tracing::info!("Get artist context: {}", artist_uri);
 
-        // get the artist's information, including top tracks, related artists, and albums
+        // Prefer librespot's metadata API for the artist page: the Web API's top-tracks
+        // endpoint is unavailable to development-mode client IDs, and their per-endpoint
+        // daily quotas are quickly exhausted by album listings.
+        let mut context = match self.artist_context_via_librespot(&artist_id).await {
+            Ok(context) => context,
+            Err(err) => {
+                tracing::warn!(
+                    "Failed to get artist context via librespot, falling back to the Web API: {err:#}"
+                );
+                self.artist_context_via_web_api(&artist_id).await?
+            }
+        };
 
+        // Spotify only provides 10 top tracks; extend the list with more of the artist's
+        // popular tracks from search results, which are roughly ordered by popularity.
+        if let Context::Artist {
+            artist, top_tracks, ..
+        } = &mut context
+        {
+            if top_tracks.len() < ARTIST_TRACKS_TARGET {
+                let more = self
+                    .artist_tracks_via_search(artist, top_tracks, ARTIST_TRACKS_TARGET)
+                    .await;
+                top_tracks.extend(more);
+            }
+        }
+
+        Ok(context)
+    }
+
+    /// Get an artist context (name, top tracks, albums, related artists) through
+    /// librespot's metadata API, i.e. without using the Web API.
+    async fn artist_context_via_librespot(&self, artist_id: &ArtistId<'_>) -> Result<Context> {
+        use futures::StreamExt;
+
+        let session = self.spotify.session().await;
+        let uri = SpotifyUri::from_uri(&artist_id.uri())?;
+        let metadata =
+            <librespot_metadata::Artist as librespot_metadata::Metadata>::get(&session, &uri)
+                .await
+                .context("get artist metadata via librespot")?;
+
+        let artist = Artist {
+            id: artist_id.clone_static(),
+            name: metadata.name.clone(),
+        };
+
+        // top tracks are listed per country, prefer the user's country
+        let country = session.country();
+        let top_track_uris = metadata
+            .top_tracks
+            .iter()
+            .find(|t| t.country == country)
+            .or_else(|| metadata.top_tracks.first())
+            .map(|t| t.tracks.0.clone())
+            .unwrap_or_default();
+        let top_tracks = self.tracks_via_librespot(&session, top_track_uris).await;
+
+        // albums and singles: each group holds the release variants of one album,
+        // the first entry being the current one
+        let album_uris = metadata
+            .albums
+            .iter()
+            .chain(metadata.singles.iter())
+            .filter_map(|group| group.first().cloned())
+            .collect::<Vec<_>>();
+        let albums = futures::stream::iter(album_uris)
+            .map(|uri| {
+                let session = session.clone();
+                async move {
+                    match <librespot_metadata::Album as librespot_metadata::Metadata>::get(
+                        &session, &uri,
+                    )
+                    .await
+                    {
+                        Ok(album) => Album::try_from_librespot_album(&album),
+                        Err(err) => {
+                            tracing::warn!("Failed to get album {uri:?} via librespot: {err:#}");
+                            None
+                        }
+                    }
+                }
+            })
+            .buffered(8)
+            .filter_map(|album| async move { album })
+            .collect::<Vec<_>>()
+            .await;
+        let albums = AppClient::process_artist_albums(albums);
+
+        let related_artists = metadata
+            .related
+            .iter()
+            .filter_map(Artist::try_from_librespot_artist)
+            .collect::<Vec<_>>();
+
+        Ok(Context::Artist {
+            artist,
+            top_tracks,
+            albums,
+            related_artists,
+        })
+    }
+
+    /// Get an artist context through the Web API (used when librespot is unavailable).
+    async fn artist_context_via_web_api(&self, artist_id: &ArtistId<'_>) -> Result<Context> {
         let artist = self
             .artist(artist_id.as_ref())
             .await
@@ -1596,49 +1708,43 @@ impl AppClient {
             .await
             .context("get artist's albums")?;
 
-        // The Web API's top-tracks and related-artists endpoints are unavailable to
-        // development-mode client IDs; fall back to librespot's metadata API for them.
-        let (top_tracks, related_artists) = if top_tracks.is_empty() || related_artists.is_empty() {
-            match self.artist_extras_via_librespot(&artist_id).await {
-                Ok((lr_top_tracks, lr_related_artists)) => (
-                    if top_tracks.is_empty() {
-                        lr_top_tracks
-                    } else {
-                        top_tracks
-                    },
-                    if related_artists.is_empty() {
-                        lr_related_artists
-                    } else {
-                        related_artists
-                    },
-                ),
-                Err(err) => {
-                    tracing::warn!(
-                        "Failed to get artist's top tracks/related artists via librespot: {err:#}"
-                    );
-                    (top_tracks, related_artists)
-                }
-            }
-        } else {
-            (top_tracks, related_artists)
-        };
-
-        // Spotify only provides 10 top tracks; extend the list with more of the artist's
-        // popular tracks from search results, which are roughly ordered by popularity.
-        let mut top_tracks = top_tracks;
-        if top_tracks.len() < ARTIST_TRACKS_TARGET {
-            let more = self
-                .artist_tracks_via_search(&artist, &top_tracks, ARTIST_TRACKS_TARGET)
-                .await;
-            top_tracks.extend(more);
-        }
-
         Ok(Context::Artist {
             artist,
             top_tracks,
             albums,
             related_artists,
         })
+    }
+
+    /// Get tracks' details through librespot's metadata API, keeping the given order.
+    async fn tracks_via_librespot(
+        &self,
+        session: &librespot_core::Session,
+        uris: Vec<SpotifyUri>,
+    ) -> Vec<Track> {
+        use futures::StreamExt;
+
+        futures::stream::iter(uris)
+            .map(|uri| {
+                let session = session.clone();
+                async move {
+                    match <librespot_metadata::Track as librespot_metadata::Metadata>::get(
+                        &session, &uri,
+                    )
+                    .await
+                    {
+                        Ok(track) => Track::try_from_librespot_track(track),
+                        Err(err) => {
+                            tracing::warn!("Failed to get track {uri:?} via librespot: {err:#}");
+                            None
+                        }
+                    }
+                }
+            })
+            .buffered(8)
+            .filter_map(|track| async move { track })
+            .collect::<Vec<_>>()
+            .await
     }
 
     /// Get more of an artist's popular tracks using `artist:"<name>"` track searches,
@@ -1819,11 +1925,17 @@ impl AppClient {
             .await?;
 
         let status = response.status();
+        let retry_after = response
+            .headers()
+            .get("retry-after")
+            .and_then(|v| v.to_str().ok())
+            .map(|v| format!(" (retry after {v}s)"))
+            .unwrap_or_default();
         let text = process_spotify_api_response(&response.text().await?);
         tracing::debug!("{text}");
 
         if status != StatusCode::OK {
-            anyhow::bail!("failed to send a Spotify API request {url}: {text}");
+            anyhow::bail!("failed to send a Spotify API request {url}{retry_after}: {text}");
         }
 
         Ok(serde_json::from_str(&text)?)

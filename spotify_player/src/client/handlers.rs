@@ -28,6 +28,42 @@ const EVENT_POLL_MIN_INTERVAL: Duration = Duration::from_secs(2);
 const RATE_LIMIT_MAX_RETRIES: u32 = 4;
 /// Base delay for the exponential backoff between rate-limit retries (2s, 4s, 8s, 16s).
 const RATE_LIMIT_BASE_DELAY: Duration = Duration::from_secs(2);
+/// Longest `Retry-After` we are willing to wait for inline; longer ones (e.g. a daily
+/// per-endpoint quota) put the request on hold instead.
+const RATE_LIMIT_MAX_WAIT: Duration = Duration::from_secs(120);
+
+/// Extracts Spotify's `Retry-After` duration from a request error, if present.
+fn retry_after_from_error(err: &anyhow::Error) -> Option<Duration> {
+    // errors from the app's own HTTP requests carry the header value in their message
+    let text = format!("{err:#}");
+    if let Some(pos) = text.find("retry after ") {
+        let secs = text[pos + "retry after ".len()..]
+            .chars()
+            .take_while(char::is_ascii_digit)
+            .collect::<String>();
+        if let Ok(secs) = secs.parse::<u64>() {
+            return Some(Duration::from_secs(secs));
+        }
+    }
+    // errors from `rspotify` carry the HTTP response
+    for cause in err.chain() {
+        if let Some(rspotify::ClientError::Http(http_err)) =
+            cause.downcast_ref::<rspotify::ClientError>()
+        {
+            if let rspotify::http::HttpError::StatusCode(response) = http_err.as_ref() {
+                return response
+                    .headers()
+                    .get("retry-after")?
+                    .to_str()
+                    .ok()?
+                    .parse::<u64>()
+                    .ok()
+                    .map(Duration::from_secs);
+            }
+        }
+    }
+    None
+}
 
 /// starts the client's request handler
 pub async fn start_client_handler(
@@ -57,8 +93,29 @@ pub async fn start_client_handler(
                         Ok(()) => break,
                         Err(err) => {
                             let rate_limited = format!("{err:#}").contains("429");
+                            let retry_after = if rate_limited {
+                                retry_after_from_error(&err)
+                            } else {
+                                None
+                            };
+                            if let Some(wait) = retry_after {
+                                if wait > RATE_LIMIT_MAX_WAIT {
+                                    // e.g. a daily per-endpoint quota: don't retry, put the
+                                    // request on hold so that it's not sent again before then
+                                    client.set_cooldown(&request, wait);
+                                    tracing::error!(
+                                        "Failed to handle client request: {err:#}. Spotify asked to retry after {}s, the request is on hold until then",
+                                        wait.as_secs()
+                                    );
+                                    break;
+                                }
+                                if !retryable {
+                                    client.set_cooldown(&request, wait);
+                                }
+                            }
                             if retryable && rate_limited && attempt < RATE_LIMIT_MAX_RETRIES {
-                                let delay = RATE_LIMIT_BASE_DELAY * 2u32.pow(attempt);
+                                let delay =
+                                    retry_after.unwrap_or(RATE_LIMIT_BASE_DELAY * 2u32.pow(attempt));
                                 attempt += 1;
                                 tracing::warn!(
                                     "Rate limited by Spotify (429), retrying in {delay:?} (attempt {attempt}/{RATE_LIMIT_MAX_RETRIES})"
